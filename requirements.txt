@@ -1,0 +1,4 @@
+pyTelegramBotAPI
+oauth2client
+gspread
+python-telegram-bot-calendar
