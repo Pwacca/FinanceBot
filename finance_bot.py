@@ -84,7 +84,7 @@ budget_sheet = client.open("Бюджет Катя/Лука").worksheet("P&L")
 
 # Списки категорий
 needs_categories = [
-    "Продукты2", "Дом расходники", "Такси", "Здоровье",
+    "Продукты", "Дом расходники", "Такси", "Здоровье",
     "Катя Терапия", "Лука Терапия", "Катя Немецкий", "Лука Английский",
     "Моб. интернет", "Электричество", "Аренда", "Газ", "Вода", "Дом интернет", "Налоги",
 ]
@@ -96,7 +96,7 @@ wants_categories = [
 income_categories = [
     "Яндекс", "Батон", "Аренда Лука", "Шалаш", "Аренда Катя", "Прочее Лука", "Прочее Катя"
 ]
-currencies = ["Драмы", "Рубли", "Доллары", "Динары"]
+currencies = ["Динары", "Драмы", "Рубли", "Доллары"]
 
 # Хранение данных пользователя
 user_data = {}
@@ -227,33 +227,35 @@ def save_expense(chat_id, user_data, message):
     # Получение данных бюджета
     budget_data = budget_sheet.get_all_values()
     month_column_index = find_month_column(budget_data, datetime.now().strftime("%m.%y"))
+    
+    row = [timestamp, user_name, category, amount, currency, comment, current_month]
 
-    # Получение валюты категории из таблицы
-    category_currency = get_category_currency(budget_data, category)
+#     # Получение валюты категории из таблицы
+#     category_currency = get_category_currency(budget_data, category)
 
-    # Проверка, совпадают ли валюта категории и валюта операции
-    if category_currency == currency:
-        # Если валюты совпадают, добавляем как есть
-        row = [timestamp, user_name, category, amount, currency, comment, current_month]
-    else:
-        # Если валюты не совпадают, находим курс и вставляем формулу
-        currency_pair = f"{currency}/{category_currency}"  # Формируем пару валют
-        conversion_rate = get_currency_rate(budget_data, month_column_index, currency_pair)  # Получаем курс валют
-        if conversion_rate is None:
-            # Возвращаем сообщение, если курс не найден
-            bot.send_message(chat_id, text="Не удалось найти курс для конвертации валют. Расход не сохранен.")
-            return
+#     # Проверка, совпадают ли валюта категории и валюта операции
+#     if category_currency == currency:
+#         # Если валюты совпадают, добавляем как есть
+#         row = [timestamp, user_name, category, amount, currency, comment, current_month]
+#     else:
+#         # Если валюты не совпадают, находим курс и вставляем формулу
+#         currency_pair = f"{currency}/{category_currency}"  # Формируем пару валют
+#         conversion_rate = get_currency_rate(budget_data, month_column_index, currency_pair)  # Получаем курс валют
+#         if conversion_rate is None:
+#             # Возвращаем сообщение, если курс не найден
+#             bot.send_message(chat_id, text="Не удалось найти курс для конвертации валют. Расход не сохранен.")
+#             return
 
-        # Формируем формулу для вставки в ячейку
-        currency_cell = find_currency_cell(budget_data, currency_pair, month_column_index)
-        if not currency_cell:
-            bot.send_message(chat_id, text=f"Не удалось найти ячейку для курса валют {currency_pair}. Расход не сохранен.")
-            return
+#         # Формируем формулу для вставки в ячейку
+#         currency_cell = find_currency_cell(budget_data, currency_pair, month_column_index)
+#         if not currency_cell:
+#             bot.send_message(chat_id, text=f"Не удалось найти ячейку для курса валют {currency_pair}. Расход не сохранен.")
+#             return
 
-        # Формула для Google Sheets
-        formula = f"={amount} / {currency_cell}"
+#         # Формула для Google Sheets
+#         formula = f"={amount} / {currency_cell}"
 
-        row = [timestamp, user_name, category, formula, category_currency, comment, current_month]
+#         row = [timestamp, user_name, category, formula, category_currency, comment, current_month]
 
     # Вставляем строку в таблицу
     expenses_sheet.append_row(row, value_input_option='USER_ENTERED')
