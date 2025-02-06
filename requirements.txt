@@ -1,4 +1,11 @@
-pyTelegramBotAPI
+os
+telebot
 oauth2client
 gspread
-python-telegram-bot-calendar
+datetime
+time
+platform
+logging
+forex-python
+requests
+re
