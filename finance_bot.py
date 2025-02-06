@@ -4,119 +4,144 @@ from oauth2client.service_account import ServiceAccountCredentials
 import gspread
 from datetime import datetime
 from telebot import types
-from telegram_bot_calendar import DetailedTelegramCalendar, LSTEP
 import time
 import platform
+import logging
+from forex_python.converter import CurrencyRates
+import requests
+import re
 
-UNAUTHORIZED_USERS_FILE = 'unauthorized_users.txt'
+logging.basicConfig(
+    filename='bot_errors.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+    
+#определение авторизованных пользователей
+#------------------------------------------------------------------------------------------------------------------------------------------
+UNAUTHORIZED_USERS_FILE = 'unauthorized_users.txt' #файл с никами, у кого есть досутп к боту
+AUTHORIZED_USERS_FILE = 'authorized_users.txt' #файл с никами, у кого нет досутпа к боту
 
-AUTHORIZED_USERS_FILE = 'authorized_users.txt'
+def manage_user(file_path, username=None, remove=False):
+    try:
+        users = set()
+        if os.path.exists(file_path):
+            with open(file_path, 'r') as file:
+                users = {line.strip() for line in file}
+                
+        if remove and username:
+            users.discard(username)
+        elif username:
+            users.add(username)
+            
+        with open(file_path, 'w') as file:
+            file.write("\n".join(users) + "\n")
+            
+        return users
+    except (IOError, OSError) as e:
+        logging.error(f"⚠️ Ошибка работы с файлом {file_path}: {e}")
+        return set()
 
-# with open('bot_token.txt', 'r') as file:
-#     BOT_TOKEN = file.read().strip()
+# Загрузка списков пользователей через manage_user
+authorized_users = manage_user(AUTHORIZED_USERS_FILE)
+unauthorized_users = manage_user(UNAUTHORIZED_USERS_FILE)
 
+#Запуск бота
+#------------------------------------------------------------------------------------------------------------------------------------------
 # Определяем путь к токену в зависимости от операционной системы
-if platform.system() == "Darwin":  # macOS
-    token_file_path = "/Users/pwacca/pwacca_expeses_bot_token_for_tests.txt"
-elif platform.system() == "Linux":  # Linux, например на VM или Docker-контейнере
-    token_file_path = "/home/pwacca/pwacca_expeses_bot_token_main.txt"
-else:
-    raise ValueError("Неподдерживаемая операционная система")
+TOKEN_PATHS = {
+    "Darwin": "/Users/pwacca/pwacca_expeses_bot_token_for_tests.txt",
+    "Linux": "/home/pwacca/pwacca_expeses_bot_token_main.txt"
+}
+token_file_path = TOKEN_PATHS.get(platform.system())
 
+if not token_file_path:
+    raise ValueError("Неподдерживаемая операционная система")
+    
 with open(token_file_path, 'r') as file:
     BOT_TOKEN = file.read().strip()
 
-# Чтение токена из файла
-with open(token_file_path, "r") as token_file:
-    token = token_file.read().strip()
+bot = telebot.TeleBot(BOT_TOKEN) # Инициализация бота
+bot.remove_webhook() # Удаление существующего webhook
 
-def load_users(file_path):
-    """Загружает список пользователей из файла."""
-    if os.path.exists(file_path):
-        with open(file_path, 'r') as file:
-            return set(line.strip() for line in file)
-    return set()
 
-def save_user(file_path, username):
-    """Сохраняет пользователя в файл."""
-    with open(file_path, 'a') as file:
-        file.write(f"{username}\n")
+#Google Sheets
+#-------------------------------------------------------------------------------------------------------------------------------------------
 
-def remove_user(file_path, username):
-    """Удаляет пользователя из файла."""
-    users = load_users(file_path)
-    if username in users:
-        users.remove(username)
-        with open(file_path, 'w') as file:
-            for user in users:
-                file.write(f"{user}\n")
+try:
+    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    creds = ServiceAccountCredentials.from_json_keyfile_name("crypto-reality-348518-2e061a0ac6ec.json", scope)
+    client = gspread.authorize(creds)
+    spreadsheet = client.open("Бюджет Катя/Лука")
+    expenses_sheet = spreadsheet.worksheet("expenses new")
+    budget_sheet = spreadsheet.worksheet("P&L new")
+except Exception as e:
+    logging.error("Error initializing Google Sheets connection: %s", str(e))
 
-# Загрузка списков пользователей
-unauthorized_users = load_users(UNAUTHORIZED_USERS_FILE)
-authorized_users = load_users(AUTHORIZED_USERS_FILE)
-
-# Инициализация бота
-bot = telebot.TeleBot(BOT_TOKEN)
-# Удаление существующего webhook
-bot.remove_webhook()
-
-# Функция для обработки ошибок polling
-def start_polling():
-    while True:
-        try:
-            bot.polling(none_stop=True)
-        except Exception as e:
-            print(f"Error occurred: {e}")
-            bot.stop_polling()
-            time.sleep(15)
-
-# Запуск polling
-# start_polling()
-
-# Настройка доступа к Google Sheets
-scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-creds = ServiceAccountCredentials.from_json_keyfile_name("crypto-reality-348518-2e061a0ac6ec.json", scope)
-client = gspread.authorize(creds)
-
-# Открытие таблицы по названию
-expenses_sheet = client.open("Бюджет Катя/Лука").worksheet("expenses")
-budget_sheet = client.open("Бюджет Катя/Лука").worksheet("P&L")
 
 # Списки категорий
+#-------------------------------------------------------------------------------------------------------------------------------------------
 needs_categories = [
-    "Продукты", "Дом расходники", "Такси", "Здоровье",
-    "Катя Терапия", "Лука Терапия", "Катя Немецкий", "Лука Английский",
-    "Моб. интернет", "Электричество", "Аренда", "Газ", "Вода", "Дом интернет", "Налоги",
+    "Продукты", "Терапия", "Здоровье", "Косметика", "Псина", "Расходники для дома", 
+    "Аренда", "Языки", "Спорт", "Моб. интернет", "Дом интернет", "Налоги", "Комуналка",   
 ]
-wants_categories = [
-    "Кафе/бары", "Чай/кофе", "Катя хобби", "Лука хобби", "Дом аксессуары",
-    "Псина", "Подписки", "Настолки", "Маркетплейсы", "Алко домой", "Косметика", "Instax",
-    "Outdoor act.", "Одежда",  "Подарки", "Уборка", "Отпуск",
-]
-income_categories = [
-    "Яндекс", "Батон", "Аренда Лука", "Шалаш", "Аренда Катя", "Прочее Лука", "Прочее Катя"
-]
-currencies = ["Динары", "Драмы", "Рубли", "Доллары"]
 
+wants_categories = [
+    "Рестики/бары/доставка", "Чай/кофе", "Аксессуары для дома", "Хобби",
+    "Подписки", "Такси", "Одежда", "Отпуск", "Подарки", "Путешествия",
+]
+
+income_categories = [
+    "СКМС", "Шалаш", "Батон", "Аренда Лука", "Аренда Катя", "Прочие Доходы Лука", "Прочие Доходы Катя"
+]
+
+currencies = ["Динары", "Драмы", "Рубли", "Доллары", "Евро"
+]
+
+#-------------------------------------------------------------------------------------------------------------------------------------------
 # Хранение данных пользователя
 user_data = {}
 
-def generate_markup(options, include_back_button=False):
+def convert_to_euro(amount, currency_name):
+    """
+    Конвертирует сумму из указанной валюты в евро.
+    """
+    currency_map = {
+        "Динары": "RSD",
+        "Драмы": "AMD",
+        "Рубли": "RUB",
+        "Доллары": "USD",
+        "Евро": "EUR"
+    }
+    currency_code = currency_map.get(currency_name, currency_name)  # Если "Другая Валюта", то вводим код вручную
+    
+    if currency_code == "EUR":
+        return amount
+    url = 'https://api.exchangerate-api.com/v4/latest/EUR'
+    try:
+        rates = requests.get(url).json().get('rates', {})
+        if currency_code not in rates:
+            raise ValueError(f"Обменный курс для валюты '{currency_name}' недоступен.")
+        return round(amount / rates[currency_code], 2)
+    except requests.exceptions.RequestException:
+        raise ValueError("Ошибка при запросе к API.")
+
+def generate_markup(button_options, include_reset_button=True):
     """
     Создание клавиатуры с опциями.
     """
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    for option in options:
+    for option in button_options:
         markup.add(types.KeyboardButton(option))
-    if include_back_button:
+    if include_reset_button:
         markup.add(types.KeyboardButton("Вернуться на главную"))
     return markup
 
-def handle_expense_input(chat_id, text, user_data):
+def handle_expense_income_input(chat_id, text, user_data, type):
     """
     Обработка ввода категории, суммы и валюты.
     """
-    if text in needs_categories + wants_categories + ["Прочее"]:
+    if text in needs_categories + wants_categories + income_categories + ["Прочее"]:
         user_data[chat_id]["category"] = text
         return "Сумма:", types.ReplyKeyboardRemove()
     else:
@@ -127,21 +152,9 @@ def handle_expense_input(chat_id, text, user_data):
         except ValueError:
             return "Нужны цифры", None
 
-def handle_income_input(chat_id, text, user_data):
-    """
-    Обработка ввода категории, суммы и валюты для доходов.
-    """
-    if text in income_categories + ["Прочее"]:
-        user_data[chat_id]["category"] = text
-        return "Сумма:", types.ReplyKeyboardRemove()
-    else:
-        try:
-            amount = float(text)
-            user_data[chat_id]["amount"] = amount
-            return "Валюта:", generate_markup(currencies)
-        except ValueError:
-            return "Нужны цифры", None
-
+def send_message_with_markup(chat_id, text, options, include_reset=True):
+    bot.send_message(chat_id, text=text, reply_markup=generate_markup(options, include_reset_button=include_reset))
+    
 def handle_currency_input(chat_id, text, user_data, context_type, message):
     """
     Обработка ввода валюты и комментария.
@@ -151,345 +164,167 @@ def handle_currency_input(chat_id, text, user_data, context_type, message):
         if user_data[chat_id]["category"] == "Прочее":
             bot.send_message(chat_id, text="Комментарий к расходу:", reply_markup=types.ReplyKeyboardRemove())
         else:
-            markup = generate_markup(["Пропустить"], include_back_button=True)
-            bot.send_message(chat_id, text="Введите комментарий к расходу или нажмите 'Пропустить':", reply_markup=markup)
+            markup = generate_markup(["Пропустить"])
+            send_message_with_markup(chat_id, "Комментарий? Можно пропустить:", ["Пропустить"])
     else:
         bot.send_message(chat_id, text="Нет такой валюты")
 
-def save_and_respond_expense(chat_id, text, message):
+def save_and_respond_expense_income(chat_id, text, message, context_type):
     """
     Сохранение расхода и отправка ответа пользователю.
     """
-    if user_data[chat_id]["category"] == "Прочее" and text == "Пропустить":
+    if context_type == "expense" and user_data[chat_id]["category"] == "Прочее" and text == "Пропустить":
         bot.send_message(chat_id, text="Комментарий обязателен для категории 'Прочее'")
     else:
         user_data[chat_id]["comment"] = text if text != "Пропустить" else ""
-        response = save_expense(chat_id, user_data, message)
+        if context_type == "expense":
+            response = save_expense_income(chat_id, user_data, message, "expense")
+        elif context_type == "income":
+            response = save_expense_income(chat_id, user_data, message, "income")
         bot.send_message(chat_id, text=response)
         reset_to_main_menu(chat_id)
-
-def save_and_respond_income(chat_id, text, message):
+        
+def save_expense_income(chat_id, user_data, message, context_type):
     """
-    Сохранение дохода и отправка ответа пользователю.
+    Сохранение данных расходов или доходов, а также расчет процента выполнения плана.
     """
-    user_data[chat_id]["comment"] = text if text != "Пропустить" else ""
-    response = save_income(chat_id, user_data, message)
-    bot.send_message(chat_id, text=response)
-    reset_to_main_menu(chat_id)
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        user_name = message.from_user.first_name
+        category = user_data[chat_id].get("category", "прочее")
+        amount = user_data[chat_id]["amount"]
+        currency = user_data[chat_id]["currency"]
+        comment = user_data[chat_id].get("comment", "")
+        euro_value = convert_to_euro(amount, currency)
+        
+        # Определение текущей даты для поиска в "P&L new"
+        current_month_str = datetime.now().strftime("01.%m.%Y")
 
-def get_category_currency(budget_data, category):
-    """
-    Получение валюты для указанной категории из Google Sheets.
-    Предполагается, что валюта указана в первой колонке строки категории.
-    """
-    for row in budget_data:
-        if row[2].strip() == category:  # Предполагаем, что категория находится в третьем столбце
-            category_currency = row[0].strip()  # Валюта в первой колонке строки категории
-            return category_currency
-    return None
-
-def find_currency_cell(budget_data, currency_pair, month_column_index):
-    """
-    Нахождение кода ячейки с курсом валют для указанной пары на текущий месяц.
-    """
-    for row_index, row in enumerate(budget_data):
-        if row[2] == currency_pair:  # Если найдена строка с парой валют
-            # Формируем код ячейки на основании строки и колонки
-            # Колонка начинается с A, затем B и так далее
-            column_letter = chr(65 + month_column_index)  # 65 - это ASCII код буквы 'A'
-            cell = f"{column_letter}{row_index + 1}"  # +1, так как индексация строк в Google Sheets начинается с 1
-            return cell
-    return None
-
-def get_currency_rate(budget_data, month_column_index, currency_pair):
-    """
-    Получение курса валют для указанной пары валют на текущий месяц.
-    Пара валют передается в формате 'RUB/AMD'.
-    """
-    for row in budget_data:
-        if row[2] == currency_pair:
-            rate_str = row[month_column_index].replace(',', '').replace('\xa0', '')
-            return float(rate_str) if rate_str else None
-    return None
-
-def save_expense(chat_id, user_data, message):
-    """
-    Сохранение данных расходов в Google Sheets и обработка бюджета с учетом валют.
-    """
-    timestamp = user_data[chat_id]["date"].strftime("%Y-%m-%d %H:%M:%S")
-    user_name = message.from_user.first_name
-    category = user_data[chat_id].get("category", "прочее")
-    amount = user_data[chat_id]["amount"]
-    currency = user_data[chat_id]["currency"]
-    comment = user_data[chat_id].get("comment", "")
-    current_month = user_data[chat_id]["date"].month
-
-    # Получение данных бюджета
-    budget_data = budget_sheet.get_all_values()
-    month_column_index = find_month_column(budget_data, datetime.now().strftime("%m.%y"))
-    
-    row = [timestamp, user_name, category, amount, currency, comment, current_month]
-
-#     # Получение валюты категории из таблицы
-#     category_currency = get_category_currency(budget_data, category)
-
-#     # Проверка, совпадают ли валюта категории и валюта операции
-#     if category_currency == currency:
-#         # Если валюты совпадают, добавляем как есть
-#         row = [timestamp, user_name, category, amount, currency, comment, current_month]
-#     else:
-#         # Если валюты не совпадают, находим курс и вставляем формулу
-#         currency_pair = f"{currency}/{category_currency}"  # Формируем пару валют
-#         conversion_rate = get_currency_rate(budget_data, month_column_index, currency_pair)  # Получаем курс валют
-#         if conversion_rate is None:
-#             # Возвращаем сообщение, если курс не найден
-#             bot.send_message(chat_id, text="Не удалось найти курс для конвертации валют. Расход не сохранен.")
-#             return
-
-#         # Формируем формулу для вставки в ячейку
-#         currency_cell = find_currency_cell(budget_data, currency_pair, month_column_index)
-#         if not currency_cell:
-#             bot.send_message(chat_id, text=f"Не удалось найти ячейку для курса валют {currency_pair}. Расход не сохранен.")
-#             return
-
-#         # Формула для Google Sheets
-#         formula = f"={amount} / {currency_cell}"
-
-#         row = [timestamp, user_name, category, formula, category_currency, comment, current_month]
-
-    # Вставляем строку в таблицу
-    expenses_sheet.append_row(row, value_input_option='USER_ENTERED')
-
-    bot.send_message(chat_id, text="Расход успешно сохранен.")
-    return get_budget_info(category)
-
-def get_budget_info(category):
-    """
-    Получение информации о бюджете для указанной категории.
-    """
-    current_month = datetime.now().strftime("%m.%y")
-    budget_data = budget_sheet.get_all_values()
-    month_column_index = find_month_column(budget_data, current_month)
-
-    if month_column_index is not None:
-        remaining_budget = calculate_remaining_budget(budget_data, month_column_index, category)
-        if remaining_budget is not None:
-            return f"Инфа сохранена,\n\n" \
-                   f"{category}:\n" \
-                   f"План: {round(remaining_budget['planned'])}; израсходовано {round(remaining_budget['actual'])} ({round((remaining_budget['actual'] / remaining_budget['planned']) * 100)}%)"
+        current_month = datetime.now().month   #Получаем номер текущего месяца
+        row = [timestamp, user_name, category, amount, currency, euro_value, comment, current_month]
+        
+        # Добавление данных в таблицу расходов
+        for attempt in range(3):  # Три попытки записи
+            try:
+                expenses_sheet.append_row(row, value_input_option='USER_ENTERED')
+                break
+            except gspread.exceptions.APIError as api_error:
+                logging.warning(f"Google Sheets API error: {api_error}, retrying...")
+                time.sleep(2)
         else:
-            return "Инфа сохранена, но не удалось найти информацию о бюджете."
-    else:
-        return "Инфа сохранена, но не удалось найти колонку с текущим месяцем."
+            raise gspread.exceptions.APIError("Не удалось записать в Google Sheets после 3 попыток.")
+            
+        # Поиск данных о бюджете
+        plan_data = get_budget_data(category)
+        
+        # Если удалось найти план и факт, добавить их в ответ
+        if plan_data and context_type == 'expense':
+            fact, plan = plan_data
+            if plan > 0:
+                percent_used = round((fact / plan) * 100, 2)
+            else:
+                percent_used = 0
+                
+            # Проверяем, превышен ли бюджет
+            if fact > plan:
+                response_message = (
+                    f"⚠️ БЮДЖЕТ ПРЕВЫШЕН!\n"
+                    f"Категория: {category}\n"
+                    f"Израсходовано: {int(fact)} из {int(plan)} EUR ({percent_used}%)\n"
+                    f"Превышение: {int(fact - plan)} EUR"
+                )
+            else:
+                response_message = (
+                    f"{category}:\n\n"
+                    f"Осталось {int(plan - fact)} из {int(plan)} EUR ({percent_used}%)"
+                )
+        elif context_type == 'income':
+            response_message = "Доход сохранен"
+        else:
+            response_message = (
+                "Расход сохранен\n\n"
+                "⚠️ Не получилось найти данные о бюджете"
+            )
+            
+            
+        bot.send_message(chat_id, response_message)
+        
+        # Возвращение в главное меню
+        handle_main_menu(chat_id)
+        
+    except gspread.exceptions.APIError as api_error:
+        logging.error("Google Sheets API error: %s", str(api_error))
+        bot.send_message(chat_id, "⚠️ Ошибка соединения с Google Sheets. Попробуйте позже.")
+    except Exception as e:
+        logging.error("Unexpected error while saving expense/income: %s", str(e))
+        bot.send_message(chat_id, "⚠️ Произошла непредвиденная ошибка.")
 
-def find_month_column(budget_data, current_month):
+def get_budget_data(category):
     """
-    Нахождение индекса колонки для текущего месяца.
+    Получает данные о бюджете (факт и план) для данной категории и текущего месяца.
+
+    :param category: Название категории
+    :return: Кортеж (факт, план) или None, если данные не найдены
     """
-    month_column_index = None
-    header_row = budget_data[0]
-
-    # Поиск колонки с текущим месяцем
-    for i, cell in enumerate(header_row):
-        cell = cell.strip()
-        if cell.endswith(current_month):
-            month_column_index = i
-            break
-
-    return month_column_index
-
-def calculate_remaining_budget(budget_data, month_column_index, category):
-    """
-    Вычисление оставшегося бюджета для указанной категории.
-    """
-    for row in budget_data[1:]:
-        if row[2] == category:  # Предполагается, что категория находится в третьем столбце
-            actual_str = row[month_column_index].replace(',', '').replace('\xa0', '')
-            planned_str = row[month_column_index + 1].replace(',', '').replace('\xa0', '')
-
-            planned = float(planned_str) if planned_str else 0.0
-            actual = float(actual_str) if actual_str else 0.0
-
-            return {"planned": planned, "actual": actual}
-    return None
-
-def save_income(chat_id, user_data, message):
-    """
-    Сохранение данных доходов в Google Sheets и обработка бюджета с учетом валют.
-    """
-    timestamp = user_data[chat_id]["date"].strftime("%Y-%м-%d %H:%M:%S")
-    user_name = message.from_user.first_name
-    category = user_data[chat_id].get("category", "прочее")
-    amount = user_data[chat_id]["amount"]
-    currency = user_data[chat_id]["currency"]
-    comment = user_data[chat_id].get("comment", "")
-    current_month = user_data[chat_id]["date"].month
-
-    # Получение данных бюджета
-    budget_data = budget_sheet.get_all_values()
-    month_column_index = find_month_column(budget_data, datetime.now().strftime("%m.%y"))
-
-    # Получение валюты категории из таблицы
-    category_currency = get_category_currency(budget_data, category)
-
-    # Проверка, совпадают ли валюта категории и валюта операции
-    if category_currency == currency:
-        # Если валюты совпадают, добавляем как есть
-        row = [timestamp, user_name, category, amount, currency, comment, current_month]
-    else:
-        # Если валюты не совпадают, находим курс и вставляем формулу
-        currency_pair = f"{currency}/{category_currency}"  # Формируем пару валют
-        conversion_rate = get_currency_rate(budget_data, month_column_index, currency_pair)  # Получаем курс валют
-        if conversion_rate is None:
-            # Возвращаем сообщение, если курс не найден
-            bot.send_message(chat_id, text="Не удалось найти курс для конвертации валют. Доход не сохранен.")
-            return
-
-        # Формируем формулу для вставки в ячейку
-        currency_cell = find_currency_cell(budget_data, currency_pair, month_column_index)
-        if not currency_cell:
-            bot.send_message(chat_id, text=f"Не удалось найти ячейку для курса валют {currency_pair}. Доход не сохранен.")
-            return
-
-        # Формула для Google Sheets
-        formula = f"={amount} / {currency_cell}"
-
-        row = [timestamp, user_name, category, formula, category_currency, comment, current_month]
-
-    # Вставляем строку в таблицу
-    expenses_sheet.append_row(row, value_input_option='USER_ENTERED')
-
-    bot.send_message(chat_id, text="Доход успешно сохранен.")
-
-def find_month_column(budget_data, current_month):
-    """
-    Нахождение индекса колонки для текущего месяца.
-    """
-    month_column_index = None
-    header_row = budget_data[0]
-
-    # Поиск колонки с текущим месяцем
-    for i, cell in enumerate(header_row):
-        cell = cell.strip()
-        if cell.endswith(current_month):
-            month_column_index = i
-            break
-
-    return month_column_index
-
-def get_summary():
-    """
-    Получение общей сводки из Google Sheets.
-    """
-    current_month = datetime.now().strftime("%m.%y")
-    budget_data = budget_sheet.get_all_values()
-    month_column_index = find_month_column(budget_data, current_month)
-    if month_column_index is None:
-        return "Не удалось найти данные за текущий месяц."
     try:
-        summary_data = extract_summary_data(budget_data, month_column_index)
-        return format_summary(summary_data)
-    except (IndexError, ValueError):
-        return "Не удалось получить корректные данные."
+        # Автоматически получаем текущую дату в нужном формате "MM.YY"
+        current_month_formatted = datetime.now().strftime("%m.%y")
+        
+        # Получение всех данных с листа "P&L new"
+        budget_data = budget_sheet.get_all_values()
+        
+        # Найти строку с нужной категорией (по колонке C)
+        category_row = None
+        for i, row in enumerate(budget_data):
+            if row[2].strip().lower() == category.lower():  # Колонка C = индекс 2
+                category_row = i
+                break
+        if category_row is None:
+            return None  # Категория не найдена
+        # Найти колонку с текущим месяцем (по строке 1)
+        month_col = None
+        for j, cell in enumerate(budget_data[0]):  # Перебираем заголовки (первая строка)
+            if cell.strip() == current_month_formatted:  # Сравниваем с "MM.YY"
+                month_col = j
+                break
+        if month_col is None:
+            return None  # Дата не найдена
+    
+        # Получить факт и план (факт в найденной колонке, план - в колонке справа)
+        fact_raw = budget_data[category_row][month_col] if budget_data[category_row][month_col] else "0"
+        plan_raw = budget_data[category_row][month_col + 1] if budget_data[category_row][month_col + 1] else "0"
+    
+        fact = float(re.sub(r"\s+", "", fact_raw).replace(",", ".")) if fact_raw else 0
+        plan = float(re.sub(r"\s+", "", plan_raw).replace(",", ".")) if plan_raw else 0
+    
+        return fact, plan  # Вернуть найденные данные
 
-def extract_summary_data(budget_data, month_column_index):
-    """
-    Извлечение данных для сводки.
-    """
-    income_actual = float(budget_data[3][month_column_index].replace(',', '').replace('\xa0', ''))
-    needs_expenses_actual = float(budget_data[5][month_column_index].replace(',', '').replace('\xa0', ''))
-    wants_expenses_actual = float(budget_data[6][month_column_index].replace(',', '').replace('\xa0', ''))
-    free_money_str = budget_data[7][month_column_index].replace(',', '').replace('\xa0', '')
-    if free_money_str.startswith('(') and free_money_str.endswith(')'):
-        free_money = -float(free_money_str.strip('()'))
-    else:
-        free_money = float(free_money_str)
-    income_planned = float(budget_data[3][month_column_index + 1].replace(',', '').replace('\xa0', ''))
-    needs_expenses_planned = float(budget_data[5][month_column_index + 1].replace(',', '').replace('\xa0', ''))
-    wants_expenses_planned = float(budget_data[6][month_column_index + 1].replace(',', '').replace('\xa0', ''))
-    return {
-        "income_actual": income_actual,
-        "needs_expenses_actual": needs_expenses_actual,
-        "wants_expenses_actual": wants_expenses_actual,
-        "free_money": free_money,
-        "income_planned": income_planned,
-        "needs_expenses_planned": needs_expenses_planned,
-        "wants_expenses_planned": wants_expenses_planned
-    }
-
-def format_summary(summary_data):
-    """
-    Форматирование сводки для отображения.
-    """
-    income_percentage = (summary_data["income_actual"] / summary_data["income_planned"]) * 100 if summary_data["income_planned"] else 0
-    needs_expenses_percentage = (summary_data["needs_expenses_actual"] / summary_data["needs_expenses_planned"]) * 100 if summary_data["needs_expenses_planned"] else 0
-    wants_expenses_percentage = (summary_data["wants_expenses_actual"] / summary_data["wants_expenses_planned"]) * 100 if summary_data["wants_expenses_planned"] else 0
-
-    return (
-        f"Общая сводка за текущий месяц:\n"
-        f"Доход: {round(summary_data['income_actual'])} ({round(income_percentage)}% от плана)\n"
-        f"Расходы на Needs: {round(summary_data['needs_expenses_actual'])} ({round(needs_expenses_percentage)}% от плана)\n"
-        f"Расходы на Wants: {round(summary_data['wants_expenses_actual'])} ({round(wants_expenses_percentage)}% от плана)\n"
-        f"Свободные деньги: {round(summary_data['free_money'])}"
-    )
-
-def get_category_summary(category):
-    """
-    Получение сводки по категории из Google Sheets.
-    """
-    current_month = datetime.now().strftime("%m.%y")
-    budget_data = budget_sheet.get_all_values()
-    month_column_index = find_month_column(budget_data, current_month)
-
-    if month_column_index is None:
-        return "Не удалось найти данные за текущий месяц."
-
-    try:
-        for row in budget_data:
-            if row[2] == category:
-                actual_str = row[month_column_index].replace(',', '').replace('\xa0', '')
-                planned_str = row[month_column_index + 1].replace(',', '').replace('\xa0', '')
-                actual = float(actual_str) if actual_str else 0.0
-                planned = float(planned_str) if planned_str else 0.0
-                if planned != 0:
-                    remaining = planned - actual
-                    remaining_percentage = ((planned - actual) / planned) * 100
-                    remaining_info = f"({round(remaining_percentage)}%)"
-                else:
-                    remaining = planned - actual
-                    remaining_info = ""
-                return f"Категория: '{category}':\n" \
-                       f"Факт: {round(actual)}\n" \
-                       f"План: {round(planned)}\n" \
-                       f"Осталось: {round(remaining)} {remaining_info}"
-    except (IndexError, ValueError):
-        return "Не удалось получить корректные данные."
-
-    return "Не удалось найти данные для указанной категории."
+    except Exception as e:
+        logging.error(f"⚠️ Ошибка при получении данных о бюджете: {e}")
+        return None
+    
 def start(message):
     """
     Обработка команды /start, приветствие пользователя.
     """
-    markup = generate_markup(["Добавить расход", "Добавить приход", "Технические операции", "Общая сводка", "Сводка по категории"])
+#   markup = generate_markup(["Добавить расход", "Добавить приход"], include_reset_button=False)
+    markup = generate_markup(["Добавить расход", "Добавить приход", "Технические операции"], include_reset_button=False)
     bot.send_message(message.chat.id, text="Привет, {0.first_name}!".format(message.from_user), reply_markup=markup)
 
 @bot.message_handler(content_types=['text'])
 
-@bot.message_handler(content_types=['text'])
 def handle_text(message):
     """
     Обработка текстовых сообщений от пользователя.
     """
     chat_id = message.chat.id
     username = message.from_user.username
-
-    # Проверка авторизации
+    
     if not handle_authorization(chat_id, username):
         return
-
+    
     text = message.text
-
-    # Обработка команд
+    
     if text == "Вернуться на главную":
         handle_main_menu(chat_id)
     elif text == "Добавить расход":
@@ -497,11 +332,9 @@ def handle_text(message):
     elif text == "Добавить приход":
         start_add_income(chat_id, username)
     elif text == "Технические операции":
-        start_technical_operations(chat_id, username)
+        handle_technical_operations(chat_id, text, message)
     elif text == "Общая сводка":
-        show_summary(chat_id)
-    elif text == "Сводка по категории":
-        start_category_summary(chat_id, username)
+        handle_category_summary(chat_id, text)
     else:
         handle_contextual_input(chat_id, text, message)
 
@@ -509,81 +342,178 @@ def handle_authorization(chat_id, username):
     """
     Проверка авторизации пользователя.
     """
-    if username not in authorized_users:
-        if username not in unauthorized_users:
-            unauthorized_users.add(username)
-            save_user(UNAUTHORIZED_USERS_FILE, username)
-            user_data[chat_id] = {'username': username}
-            bot.send_message(chat_id, "Вы не авторизованы для использования этого бота. Запрос на авторизацию отправлен владельцу.")
-            notify_admin_for_authorization(username)
-        return False
-    return True
+    if username in authorized_users:
+        return True
+    
+    if username not in unauthorized_users:
+        unauthorized_users.add(username)
+        save_user(UNAUTHORIZED_USERS_FILE, username)
+        user_data[chat_id] = {'username': username}
+        bot.send_message(chat_id, "Вы не авторизованы для использования этого бота. Запрос на авторизацию отправлен владельцу.")
+        notify_admin_for_authorization(username)
+        
+    return False
 
 def notify_admin_for_authorization(username):
     """
     Уведомление администратора о запросе на авторизацию.
     """
-    notification_chat_id = 64003764
+    ADMIN_CHAT_ID = 64003764
     markup = types.InlineKeyboardMarkup()
     authorize_button = types.InlineKeyboardButton(text="Авторизовать пользователя", callback_data=f"authorize_{username}")
     ignore_button = types.InlineKeyboardButton(text="Игнорировать", callback_data=f"ignore_{username}")
     markup.add(authorize_button, ignore_button)
-    bot.send_message(notification_chat_id, f"Неавторизованный пользователь: @{username} пытался получить доступ к боту.", reply_markup=markup)
+    bot.send_message(ADMIN_CHAT_ID, f"Неавторизованный пользователь: @{username} пытался получить доступ к боту.", reply_markup=markup)
 
 def handle_main_menu(chat_id):
     """
-    Возврат на главный экран.
+    Главное меню бота.
     """
     user_data.pop(chat_id, None)
-    markup = generate_markup(["Добавить расход", "Добавить приход", "Технические операции", "Общая сводка", "Сводка по категории"])
-    bot.send_message(chat_id, text="Что вы хотите сделать дальше?", reply_markup=markup)
+    markup = generate_markup(["Добавить расход", "Добавить приход", "Технические операции"], include_reset_button=False)
+    bot.send_message(chat_id, text="Что дальше?", reply_markup=markup)
+
+def handle_technical_operations(chat_id, text, message):
+    """
+    Обработка нажатия на кнопку 'Технические операции'.
+    """
+    if text == "Технические операции":
+        markup = generate_markup(["Общая сводка"])
+        bot.send_message(chat_id, "Выберите действие:", reply_markup=markup)
+
+def handle_category_summary(chat_id, text):
+    """
+    Получает и отправляет пользователю общую сводку расходов.
+    """
+    if text == "Общая сводка":
+        try:
+            summary_text = get_overall_budget_summary()
+            bot.send_message(chat_id, summary_text)
+        except Exception as e:
+            logging.error(f"⚠️ Ошибка при получении общей сводки: {e}")
+            bot.send_message(chat_id, "⚠️ Ошибка при получении данных. Попробуйте позже.")
+
+def get_overall_budget_summary():
+    """
+    Получает данные бюджета и формирует текст с тремя отдельными секциями:
+    1. Суммарные доходы
+    2. Needs (Обязательные расходы)
+    3. Wants (Желаемые траты)
+    """
+    try:
+        budget_data = budget_sheet.get_all_values()
+        
+        # Автоматически получаем текущий месяц в формате "MM.YY"
+        current_month_str = datetime.now().strftime("%m.%y")
+        
+        # Определяем индекс колонки с текущим месяцем
+        month_col = None
+        for j, cell in enumerate(budget_data[0]):  # Перебираем заголовки (первая строка)
+            if cell.strip() == current_month_str:
+                month_col = j
+                break
+        
+        if month_col is None:
+            return "⚠️ Данные за текущий месяц не найдены."
+        
+        # Суммарные показатели доходов
+        total_income_fact = 0
+        total_income_plan = 0
+        
+        # Словари для хранения категорий расходов
+        needs_summary = {}
+        wants_summary = {}
+        
+        # Проходим по строкам бюджета
+        for i, row in enumerate(budget_data[1:]):  # Пропускаем заголовок (i - индекс строки)
+            if len(row) <= month_col + 1:  # Проверяем, достаточно ли колонок
+                continue  # Пропускаем строки с недостаточным числом колонок
+    
+            category = row[2].strip() if len(row) > 2 else ""
+    
+            # Пропускаем пустые категории
+            if not category:
+                continue
+    
+            try:
+                fact_raw = row[month_col] if row[month_col] else "0"
+                plan_raw = row[month_col + 1] if row[month_col + 1] else "0"
+                
+                # Очищаем числа от пробелов и заменяем запятые на точки
+                fact = float(re.sub(r"\s+", "", fact_raw).replace(",", ".")) if fact_raw else 0
+                plan = float(re.sub(r"\s+", "", plan_raw).replace(",", ".")) if plan_raw else 0
+                
+                if category in income_categories:
+                    # Считаем общий доход
+                    total_income_fact += fact
+                    total_income_plan += plan
+                else:
+                    # Рассчитываем остаток для расходов
+                    remaining = int(plan) - int(fact)
+                    print(f"Категория: {category}, Факт: {fact}, План: {plan}, 90%: {plan * 0.9}, 105%: {plan * 1.05}")
+                    # Формируем строку с дополнительными знаками в зависимости от ситуации
+                    if fact == 0:
+                        formatted_text = f"{category}: {int(plan)} EUR"
+                    elif fact > 0 and fact < plan * 0.9:  # Меньше 90% от плана – без знака
+                        formatted_text = f"{category}: {int(remaining)} из {int(plan)} EUR"
+                    elif plan * 0.9 <= fact <= plan * 1.05:  # От 90% до 105% от плана – ⚠️
+                        formatted_text = f"{category}: {int(remaining)} из {int(plan)} EUR ⚠️"
+                    elif fact > plan * 1.1:  # Больше 110% от плана – ❌
+                        formatted_text = f"{category}: {-int(remaining)} EUR ❌"
+                    else:  # Между 105% и 110% (неявное превышение) – без знака
+                        formatted_text = f"{category}: {-int(remaining)} EUR"
+                        
+                    # Сортируем по категориям
+                    if category in needs_categories:
+                        needs_summary[category] = formatted_text
+                    elif category in wants_categories:
+                        wants_summary[category] = formatted_text
+                        
+            except ValueError as ve:
+                logging.error(f"⚠️ Ошибка преобразования данных в строке {i + 1}: {ve}")
+                continue  # Игнорируем ошибочную строку
+    
+        # Формируем итоговый текст, соблюдая порядок категорий
+        summary_text = ""
+    
+        # Добавляем суммарные доходы
+        summary_text += f"💰 Доходы: {int(total_income_fact)} из {int(total_income_plan)} EUR\n"
+    
+        if needs_summary:
+            summary_text += "\n🏠 Needs:\n"
+            for category in needs_categories:
+                if category in needs_summary:
+                    summary_text += f"{needs_summary[category]}\n"
+                    
+        if wants_summary:
+            summary_text += "\n🎉 Wants:\n"
+            for category in wants_categories:
+                if category in wants_summary:
+                    summary_text += f"{wants_summary[category]}\n"
+                    
+        return summary_text if summary_text else "⚠️ Данные бюджета недоступны."
+
+    except Exception as e:
+        logging.error(f"⚠️ Ошибка при обработке данных бюджета: {e}")
+        return "⚠️ Ошибка при обработке данных бюджета."
 
 def start_add_expense(chat_id, username):
     """
     Начало процесса добавления расхода.
     """
-    user_data[chat_id] = {"context": "add_expense", "username": username, "date": datetime.now()}
-    markup = generate_markup(["Needs", "Wants", "Прочее"], include_back_button=True)
-    inline_markup = types.InlineKeyboardMarkup()
-    change_date_button = types.InlineKeyboardButton(text="Поменять дату", callback_data="change_date")
-    inline_markup.add(change_date_button)
+#   user_data[chat_id] = {"context": "add_expense", "username": username, "date": datetime.now()}
+    user_data[chat_id] = {"context": "add_expense", "username": username}
+    markup = generate_markup(["Needs", "Wants", "Прочее"])
     bot.send_message(chat_id, text="Тип расхода:", reply_markup=markup)
-    bot.send_message(chat_id, text="Выберите действие:", reply_markup=inline_markup)
-
+    
 def start_add_income(chat_id, username):
     """
     Начало процесса добавления дохода.
     """
-    user_data[chat_id] = {"context": "add_income", "username": username, "date": datetime.now()}
-    markup = generate_markup(income_categories, include_back_button=True)
-    inline_markup = types.InlineKeyboardMarkup()
-    change_date_button = types.InlineKeyboardButton(text="Поменять дату", callback_data="change_date")
-    inline_markup.add(change_date_button)
+#   user_data[chat_id] = {"context": "add_income", "username": username, "date": datetime.now()}
+    user_data[chat_id] = {"context": "add_income", "username": username}
+    markup = generate_markup(income_categories)
     bot.send_message(chat_id, text="Тип дохода:", reply_markup=markup)
-    bot.send_message(chat_id, text="Выберите действие:", reply_markup=inline_markup)
-
-def start_technical_operations(chat_id, username):
-    """
-    Начало процесса выполнения технических операций.
-    """
-    user_data[chat_id] = {"context": "technical_operations", "username": username, "date": datetime.now()}
-    markup = generate_markup(["Конвертация рубли->драмы", "Отложить Лука", "Отложить Катя"], include_back_button=True)
-    bot.send_message(chat_id, text="Выберите операцию:", reply_markup=markup)
-
-def show_summary(chat_id):
-    """
-    Отображение общей сводки.
-    """
-    summary = get_summary()
-    bot.send_message(chat_id, text=summary)
-
-def start_category_summary(chat_id, username):
-    """
-    Начало процесса отображения сводки по категории.
-    """
-    user_data[chat_id] = {"context": "category_summary", "username": username}
-    markup = generate_markup(["Needs", "Wants"], include_back_button=True)
-    bot.send_message(chat_id, text="Выберите группу категорий:", reply_markup=markup)
 
 def handle_contextual_input(chat_id, text, message):
     """
@@ -596,236 +526,79 @@ def handle_contextual_input(chat_id, text, message):
     context = user_data.get(chat_id, {}).get("context")
 
     if context == "add_expense":
-        handle_add_expense(chat_id, text, message)
+        handle_transaction(chat_id, text, message, "expense")
     elif context == "add_income":
-        handle_add_income(chat_id, text, message)
+        handle_transaction(chat_id, text, message, "income")
     elif context == "category_summary":
         handle_category_summary(chat_id, text)
     elif context == "technical_operations":
         handle_technical_operations(chat_id, text, message)
 
-def handle_add_expense(chat_id, text, message):
+def handle_transaction(chat_id, text, message, context_type):
     """
-    Обработка ввода для добавления расхода.
+    Обработка ввода для расходов и доходов.
     """
-    if text in ["Needs", "Wants"]:
+    categories = needs_categories + wants_categories + income_categories + ["Прочее"]
+    
+    if text in ["Needs", "Wants"] and context_type == "expense":
         user_data[chat_id]["type"] = text
-        categories = needs_categories if text == "Needs" else wants_categories
-        markup = generate_markup(categories, include_back_button=True)
-        bot.send_message(chat_id, text="Категория:", reply_markup=markup)
-    elif text in needs_categories + wants_categories + ["Прочее"]:
+        category_list = needs_categories if text == "Needs" else wants_categories
+        bot.send_message(chat_id, text="Категория:", reply_markup=generate_markup(category_list, include_reset_button=True))
+        return
+    
+    if "category" not in user_data[chat_id]:
         user_data[chat_id]["category"] = text
         bot.send_message(chat_id, text="Сумма:", reply_markup=types.ReplyKeyboardRemove())
-    elif "category" in user_data[chat_id] and "amount" not in user_data[chat_id]:
-        response, markup = handle_expense_input(chat_id, text, user_data)
-        bot.send_message(chat_id, text=response, reply_markup=markup)
-    elif "amount" in user_data[chat_id] and "currency" not in user_data[chat_id]:
-        handle_currency_input(chat_id, text, user_data, "expense", message)
-    elif "currency" in user_data[chat_id] and "comment" not in user_data[chat_id]:
-        save_and_respond_expense(chat_id, text, message)
-
-def handle_add_income(chat_id, text, message):
-    """
-    Обработка ввода для добавления дохода.
-    """
-    if text in income_categories + ["Прочее"]:
-        user_data[chat_id]["category"] = text
-        bot.send_message(chat_id, text="Сумма:", reply_markup=types.ReplyKeyboardRemove())
-    elif "category" in user_data[chat_id] and "amount" not in user_data[chat_id]:
-        response, markup = handle_income_input(chat_id, text, user_data)
-        bot.send_message(chat_id, text=response, reply_markup=markup)
-    elif "amount" in user_data[chat_id] and "currency" not in user_data[chat_id]:
-        handle_currency_input(chat_id, text, user_data, "income", message)
-    elif "currency" in user_data[chat_id] and "comment" not in user_data[chat_id]:
-        save_and_respond_income(chat_id, text, message)
-
-# Строка 392
-def handle_technical_operations(chat_id, text, message):
-    """
-    Обработка ввода для технических операций.
-    """
-    if text == "Конвертация рубли->драмы":
-        user_data[chat_id]["category"] = text
-        bot.send_message(chat_id, text="Введите сумму в рублях:", reply_markup=types.ReplyKeyboardRemove())
-    elif text == "Отложить Лука":
-        user_data[chat_id]["category"] = "Отложено Лука"
-        bot.send_message(chat_id, text="Выберите валюту:", reply_markup=generate_markup(currencies, include_back_button=True))
-    elif text == "Отложить Катя":
-        user_data[chat_id]["category"] = "Отложено Катя"
-        bot.send_message(chat_id, text="Выберите валюту:", reply_markup=generate_markup(currencies, include_back_button=True))
-    elif user_data[chat_id]["category"] in ["Отложено Лука", "Отложено Катя"] and "currency" not in user_data[chat_id]:
+        return
+    
+    if "amount" not in user_data[chat_id]:
+        try:
+            user_data[chat_id]["amount"] = float(text)  # Convert amount to float
+            bot.send_message(chat_id, text="Валюта:", reply_markup=generate_markup(currencies))
+        except ValueError:
+            bot.send_message(chat_id, text="Введите корректную сумму (только числа).")
+        return
+    
+    if "currency" not in user_data[chat_id]:
         if text in currencies:
             user_data[chat_id]["currency"] = text
-            bot.send_message(chat_id, text="Введите сумму:", reply_markup=types.ReplyKeyboardRemove())
+            markup = generate_markup(["Пропустить"])
+            bot.send_message(chat_id, text="Введите комментарий или нажмите 'Пропустить':", reply_markup=markup)
         else:
-            bot.send_message(chat_id, text="Нет такой валюты", reply_markup=None)
-    elif user_data[chat_id]["category"] in ["Отложено Лука", "Отложено Катя"] and "amount" not in user_data[chat_id]:
-        try:
-            amount = float(text)
-            user_data[chat_id]["amount"] = amount
-            save_and_respond_saving(chat_id, message)
-        except ValueError:
-            bot.send_message(chat_id, text="Нужны цифры", reply_markup=None)
-    elif "category" in user_data[chat_id] and user_data[chat_id]["category"] == "Конвертация рубли->драмы" and "amount_rub" not in user_data[chat_id]:
-        try:
-            amount_rub = float(text)
-            user_data[chat_id]["amount_rub"] = amount_rub
-            bot.send_message(chat_id, text="Введите сумму в драмах:")
-        except ValueError:
-            bot.send_message(chat_id, text="Нужны цифры", reply_markup=None)
-    elif "amount_rub" in user_data[chat_id] and "amount_dram" not in user_data[chat_id]:
-        try:
-            amount_dram = float(text)
-            user_data[chat_id]["amount_dram"] = amount_dram
-            save_and_respond_conversion(chat_id, message)
-        except ValueError:
-            bot.send_message(chat_id, text="Нужны цифры", reply_markup=None)
-
-def save_and_respond_saving(chat_id, message):
-    """
-    Сохранение данных откладывания денег и отправка ответа пользователю.
-    """
-    timestamp = user_data[chat_id]["date"].strftime("%Y-%m-%d %H:%М:%С")
-    user_name = message.from_user.first_name
-    category = user_data[chat_id]["category"]
-    currency = user_data[chat_id]["currency"]
-    amount = user_data[chat_id]["amount"]
-    current_month = user_data[chat_id]["date"].month
-
-    # Определяем полное название категории
-    if currency == "Драмы":
-        full_category = f"{category} д"
-    else:
-        full_category = f"{category} р"
-
-    # Сохранение данных в таблицу
-    row = [timestamp, user_name, full_category, amount, currency, "", current_month]
-    expenses_sheet.append_row(row)
-
-    bot.send_message(chat_id, text="Данные сохранены.")
-    reset_to_main_menu(chat_id)
-
-def save_and_respond_conversion(chat_id, message):
-    """
-    Сохранение данных конвертации и отправка ответа пользователю.
-    """
-    # Получение данных для расхода в рублях
-    timestamp = user_data[chat_id]["date"].strftime("%Y-%m-%d %H:%M:%S")
-    user_name = message.from_user.first_name
-    amount_rub = user_data[chat_id]["amount_rub"]
-    amount_dram = user_data[chat_id]["amount_dram"]
-    current_month = user_data[chat_id]["date"].month
-
-    # Сохранение расхода в рублях
-    expense_row = [timestamp, user_name, "Конвертация руб", amount_rub, "Рубли", "", current_month]
-    expenses_sheet.append_row(expense_row)
-
-    # Сохранение дохода в драмах
-    income_row = [timestamp, user_name, "Доход от конверт.", amount_dram, "Драмы", "", current_month]
-    expenses_sheet.append_row(income_row)  # Если доходы и расходы в одной таблице
-
-    bot.send_message(chat_id, text="Конвертация завершена. Данные сохранены.")
-    reset_to_main_menu(chat_id)
-
-def save_and_respond_technical_operation(chat_id, text, message):
-    """
-    Сохранение технической операции и отправка ответа пользователю.
-    """
-    user_data[chat_id]["comment"] = text if text != "Пропустить" else ""
-    if user_data[chat_id]["category"] == "Конвертация руб":
-        response = save_expense(chat_id, user_data, message)
-    elif user_data[chat_id]["category"] == "Доход от конверт.":
-        response = save_income(chat_id, user_data, message)
-    bot.send_message(chat_id, text=response)
-    reset_to_main_menu(chat_id)
-
-def handle_category_summary(chat_id, text):
-    """
-    Обработка ввода для отображения сводки по категории.
-    """
-    if text in ["Needs", "Wants"]:
-        user_data[chat_id]["group"] = text
-        categories = needs_categories if text == "Needs" else wants_categories
-        markup = generate_markup(categories, include_back_button=True)
-        bot.send_message(chat_id, text="Выберите категорию:", reply_markup=markup)
-    elif text in needs_categories + wants_categories:
-        response = get_category_summary(text)
-        bot.send_message(chat_id, text=response)
-        reset_to_main_menu(chat_id)
-
+            bot.send_message(chat_id, text="Нет такой валюты, выберите из списка.")
+        return
+    
+    if "comment" not in user_data[chat_id]:
+        user_data[chat_id]["comment"] = text if text != "Пропустить" else ""
+        save_and_respond_expense_income(chat_id, text, message, context_type)
+        
+    save_and_respond_expense_income(chat_id, text, message, context_type)
+        
 def reset_to_main_menu(chat_id):
     """
     Сброс данных пользователя и возврат к главному меню.
     """
     user_data.pop(chat_id, None)
-    markup = generate_markup(["Добавить расход", "Добавить приход", "Технические операции", "Общая сводка", "Сводка по категории"])
-    bot.send_message(chat_id, text="Добавить еще информацию?", reply_markup=markup)
+    markup = generate_markup(["Добавить расход", "Добавить приход", "Технические операции"])
+    bot.send_message(chat_id, text="Что дальше?", reply_markup=markup)
 
-def create_compact_day_selection_keyboard():
+@bot.message_handler(commands=['start'])
+def start(message):
     """
-    Создание компактной клавиатуры для выбора дня.
+    Обработка команды /start, приветствие пользователя.
     """
-    markup = types.InlineKeyboardMarkup()
-    days = [types.InlineKeyboardButton(text=str(day), callback_data=f"day_{day}") for day in range(1, 32)]
-    for i in range(0, len(days), 7):
-        markup.row(*days[i:i+7])
-    markup.add(types.InlineKeyboardButton(text="Изменить месяц", callback_data="change_month"))
-    markup.add(types.InlineKeyboardButton(text="Изменить год", callback_data="change_year"))
-    return markup
-
-@bot.callback_query_handler(func=lambda call: call.data == "change_date")
-def callback_change_date(call):
-    """
-    Обработка нажатия кнопки "Поменять дату".
-    """
-    markup = create_compact_day_selection_keyboard()
-    bot.edit_message_text("Выберите день:", call.message.chat.id, call.message.message_id, reply_markup=markup)
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith("day_"))
-def callback_select_day(call):
-    """
-    Обработка выбора дня.
-    """
-    day = int(call.data.split("_")[1])
-    now = datetime.now()
-    try:
-        selected_date = now.replace(day=day)
-    except ValueError:
-        selected_date = now.replace(day=28)  # Если день выходит за пределы текущего месяца
-    user_data[call.message.chat.id]["date"] = selected_date
-    bot.edit_message_text(f"Выбрана дата: {selected_date.strftime('%Y-%m-%d')}", call.message.chat.id, call.message.message_id)
-
-@bot.callback_query_handler(func=lambda call: call.data == "change_month")
-def callback_change_month(call):
-    """
-    Обработка нажатия кнопки "Изменить месяц".
-    """
-    now = datetime.now().date()
-    calendar, step = DetailedTelegramCalendar(min_date=now.replace(day=1), locale='ru', start_from=LSTEP['m']).build()
-    bot.edit_message_text(f"Выберите {step}", call.message.chat.id, call.message.message_id, reply_markup=calendar)
-
-@bot.callback_query_handler(func=lambda call: call.data == "change_year")
-def callback_change_year(call):
-    """
-    Обработка нажатия кнопки "Изменить год".
-    """
-    now = datetime.now().date()
-    calendar, step = DetailedTelegramCalendar(min_date=now.replace(day=1), locale='ru', start_from=LSTEP['y']).build()
-    bot.edit_message_text(f"Выберите {step}", call.message.chat.id, call.message.message_id, reply_markup=calendar)
-
-@bot.callback_query_handler(func=DetailedTelegramCalendar.func())
-def handle_calendar(call):
-    """
-    Обработка выбора даты из календаря.
-    """
-    now = datetime.now().date()
-    result, key, step = DetailedTelegramCalendar(min_date=now.replace(day=1), locale='ru').process(call.data)
-    if not result and key:
-        bot.edit_message_text(f"Выберите {step}", call.message.chat.id, call.message.message_id, reply_markup=key)
-    elif result:
-        user_data[call.message.chat.id]["date"] = result
-        bot.edit_message_text(f"Выбрана дата: {result.strftime('%Y-%m-%d')}", call.message.chat.id, call.message.message_id)
-
-# Удаление существующего webhook
-# bot.remove_webhook()
-bot.polling(none_stop=True)
+    markup = generate_markup(["Добавить расход", "Добавить приход", "Технические операции"], include_reset_button=False)
+    bot.send_message(message.chat.id, text=f"Привет, {message.from_user.first_name}!", reply_markup=markup)
+    
+def start_bot():
+    while True:
+        try:
+            logging.info("Starting Telegram bot...")
+            bot.polling(none_stop=True, interval=1, timeout=30)
+        except Exception as e:
+            logging.error(f"Bot crashed due to: {e}", exc_info=True)
+            logging.info("Restarting bot in 5 seconds...")
+            time.sleep(5)  # Wait before restarting            
+            
+if __name__ == "__main__":
+    start_bot()
